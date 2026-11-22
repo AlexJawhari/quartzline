@@ -22,9 +22,30 @@ HEAVY = 3.0  # tests at least this long (recorded seconds) are printed, never ru
 RUN_MAX = 30.0  # never run more than this many recorded seconds of candidates
 
 
-def keep_heavy(rest, failed):
-    """Heavy candidates are kept when the cheap tests give evidence the change matters."""
-    return bool(failed) or len(rest) < MIN_EVIDENCE
+def evidence_match(heavy_id, test):
+    """Cheap tests whose failure says a heavy test may fail too: same pipeline (executor/optimizer for the TPC
+    tests), same class (parser, generator; generator also any dialect test)."""
+    cls = test["id"].split("::")[1]
+    if heavy_id.endswith("::test_max_nodes"):
+        return cls == "TestParser"
+    if heavy_id.endswith("::test_generator_memory"):
+        return cls == "TestGenerator" or test["file"].startswith("tests/dialects/")
+    return cls in ("TestExecutor", "TestOptimizer")
+
+
+def keep_heavy(rest, failed, ev):
+    """Heavy candidates the run's failures vouch for: one of their evidence tests failed, the run was too thin to
+    judge, or the damage is wide (0 misses on 454 labeled commits for the class rule)."""
+    failed = set(failed)
+    if len(rest) < MIN_EVIDENCE or len(failed) >= MANY_FAIL:
+        return set(ev)
+    return {h for h, e in ev.items() if len(failed & e) >= EV_MIN}
+
+
+MANY_FAIL = 50
+# a single failing evidence test never came with a failing heavy test: tpcds 0 of 86 labeled commits
+# (it failed in 37, always with 2+ evidence failures); tpch, max_nodes, generator_memory need far more
+EV_MIN = 2
 
 
 MIN_EVIDENCE = 2  # 0 heavy-only failures in 59 labeled commits whose cheap candidates passed
@@ -98,7 +119,7 @@ def main():
         """Print `nums` packed over workers, or every test when that is nearly as cheap: a wide
         change can fail tests our per-test maps do not tie to it (shared-process contamination)."""
         w, c = pack(nums, ms)
-        out[cid] = pack(list(range(len(tests))), ms)[0] if c >= WIDE * all_cost or len(set(nums)) >= WIDE_COUNT * len(tests) else w
+        out[cid] = all_workers if c >= WIDE * all_cost or len(set(nums)) >= WIDE_COUNT * len(tests) else w
 
     all_workers = pack(list(range(len(tests))), ms)[0]
     try:
@@ -143,12 +164,13 @@ def main():
             check_files = {f for f in mp.import_files if f.startswith("sqlglot/")}
             for f in list(check_files):  # a renamed/removed name breaks the modules that import it
                 check_files.update(mp.importer_files(f))
-            check = sorted({mp.modname(f) for f in check_files})
+            check = sorted({mp.modname(f) for f in check_files if not f.endswith("__main__.py")})
             if gm is not None and gm in nums and not any(
                     fd.path in GEN_CORE or fd.old in GEN_CORE for fd in fds):
                 nums.remove(gm)  # 0 failures in 33 labeled cases; see NOTES (only generator internals can leak)
             heavy = [n for n in nums if tests[n]["seconds"] >= HEAVY]
             rest = [n for n in nums if tests[n]["seconds"] < HEAVY]
+            ev = {h: {n for n in rest if n not in noise and evidence_match(tests[h]["id"], tests[n])} for h in heavy}
             s = sum(cpu_est[n] for n in rest) + sum(
                 cpu_map.get("class:%s::%s" % (f, c), 0.0)
                 for f, c in {tuple(tests[n]["id"].split("::")[:2]) for n in rest})
@@ -167,7 +189,7 @@ def main():
                         patched[fd.path] = patchlib.apply(fd, orig(path))
                 canary = [n for n in canary_all if n not in set(nums)] if check else []
                 jobs_todo.append(dict(cid=cid, patched=patched, run=rest if run else [], heavy=heavy, assumed=assumed, canary=canary,
-                                      nums=nums, check=check, direct=direct,
+                                      nums=nums, check=check, direct=direct, ev=ev,
                                       extra={f: mp.import_fail_bits(f) for f in check_files}))
             else:
                 emit_set(cid, direct if direct is not None else assumed)
@@ -205,8 +227,8 @@ def main():
             limits = {n: max(6.0, 5 * tests[n]["seconds"]) for n in to_run}
             try:
                 job = runner.Job(j["cid"], f"/tmp/ov_{j['cid']}", SRC, j["patched"], tests, to_run, limits,
-                                 time.time() + 80, failfast=bool(j["heavy"] and j["run"]), check=j["check"],
-                                 smoke=bool(j["check"]), noise=noise)
+                                 time.time() + 80, failfast=[sorted(e) for e in j["ev"].values() if len(e) >= EV_MIN] if j["run"] else [], check=j["check"],
+                                 smoke=bool(j["check"]), noise=noise, ev_min=EV_MIN)
                 running.append((j, job))
             except Exception:
                 log(traceback.format_exc())
@@ -248,12 +270,11 @@ def main():
                 emit_set(cid, j["nums"] + j["assumed"] + bits_to_nums(extra))
             elif not j["run"]:
                 emit_set(cid, j["direct"])
-            elif r.get("stopped"):  # heavy kept anyway: the cheap tests ride along for free
-                emit_set(cid, j["run"] + j["assumed"] + j["heavy"])
             else:
                 failed = [n for n in r["failed"] if n not in set(j["canary"])]
-                final = failed + j["assumed"] + (j["heavy"] if keep_heavy(j["run"], [n for n in failed if n not in noise]) else [])
-                emit_set(cid, final)
+                kept = sorted(keep_heavy(j["run"], [n for n in failed if n not in noise], j["ev"]))
+                # stopped: every heavy with evidence is kept, so the unrun cheap tests ride along for free
+                emit_set(cid, (j["run"] if r.get("stopped") else failed) + j["assumed"] + kept)
         time.sleep(0.005)
     for p in patches:
         print(json.dumps({"commit": p.stem, "workers": out.get(p.stem, all_workers)}))

@@ -7,6 +7,7 @@ import ast
 import json
 import marshal
 import os
+import bisect
 import re
 import zlib
 
@@ -129,10 +130,16 @@ class Mapper:
                     if f.endswith(".py"):
                         with open(f"{dp}/{f}", encoding="utf-8", errors="replace") as h:
                             self._all_text.append(h.read())
-        return any(pat.search(t) for t in self._all_text)
+        return any(name in t and pat.search(t) for t in self._all_text)
 
     def importer_files(self, rel):
-        """Source files that import module `rel` (or names from it)."""
+        """Source files that import module `rel` (or names from it). Memoised: texts are the pristine tree."""
+        memo = self.__dict__.setdefault("_impf", {})
+        if rel not in memo:
+            memo[rel] = self._importer_files(rel)
+        return list(memo[rel])
+
+    def _importer_files(self, rel):
         mod = self.modname(rel)
         leaf = mod.rsplit(".", 1)[-1]
         pkg = mod.rsplit(".", 1)[0]
@@ -146,14 +153,17 @@ class Mapper:
                 return direct.search(text) or any(leafw.search(g) for g in sub.findall(text))
 
         pat = _P
-        return [f for f in self.sqlglot_files() if f != rel and pat.search(self.text(f) or "")]
+        return [f for f in self.sqlglot_files() if f != rel and leaf in (self.text(f) or "") and pat.search(self.text(f) or "")]
 
     def importers(self, rel):
         """Bits of tests that executed anything in a sqlglot file that imports module `rel`."""
-        r = 0
-        for f in self.importer_files(rel):
-            r |= self.any_line(f)
-        return r
+        memo = self.__dict__.setdefault("_impb", {})
+        if rel not in memo:
+            r = 0
+            for f in self.importer_files(rel):
+                r |= self.any_line(f)
+            memo[rel] = r
+        return memo[rel]
 
     # ---- scope analysis of one old-file line
     def _chain(self, tree, line):
@@ -282,12 +292,20 @@ class Mapper:
         r = 0
         for f in self.sqlglot_files():
             txt = self.text(f) or ""
-            if not pat.search(txt):
+            if not any(n in txt for n in names):
                 continue
-            for i, ln in enumerate(txt.split("\n"), 1):
+            starts = self.__dict__.setdefault("_starts", {})
+            if f not in starts:
+                starts[f] = [0] + [m.end() for m in re.finditer("\n", txt)]
+            hits = {bisect.bisect_right(starts[f], m.start()) for m in pat.finditer(txt)}
+            if not hits:
+                continue
+            lines = txt.split("\n")
+            for i in sorted(hits):
+                ln = lines[i - 1]
                 if f == rel and i in own:
                     continue
-                if pat.search(ln) and not ln.lstrip().startswith("#"):
+                if not ln.lstrip().startswith("#"):
                     m = defn.match(ln)
                     if m and not pat.search(m.group(1)):
                         continue  # an override / redefinition, not a use

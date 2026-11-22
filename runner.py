@@ -120,7 +120,7 @@ def _smoke():
     return bad
 
 
-def child_main(wfd, root, src, patched, tests, nums, limits, failfast=False, check=(), smoke=False, noise=()):
+def child_main(wfd, root, src, patched, tests, nums, limits, failfast=False, check=(), smoke=False, noise=(), ev_min=1):
     """Runs in the forked child; writes a JSON result line to wfd and exits."""
     res = {"failed": [], "ok": True}
     try:
@@ -165,6 +165,10 @@ def child_main(wfd, root, src, patched, tests, nums, limits, failfast=False, che
             f, c, m = tests[n]["id"].split("::")
             by_cls.setdefault((f, c), []).append((m, n))
         failed = set()
+        sets = [set(s) for s in failfast or ()]
+
+        def _satisfied():  # every heavy candidate already has a failing evidence test: nothing left to learn
+            return bool(sets) and all(len(failed & s) >= ev_min for s in sets)
         order = sorted(by_cls.items(), key=lambda kv: sum(tests[n]["seconds"] for _, n in kv[1]))
         for (f, c), items in order:
             try:
@@ -191,12 +195,12 @@ def child_main(wfd, root, src, patched, tests, nums, limits, failfast=False, che
 
                 def _mark(self, test):
                     n = byname.get(getattr(test, "_testMethodName", None))
-                    if failfast and n not in noise:  # noise: fails on the pristine tree too, says nothing
-                        self.stop()
                     if n is None:  # setUpClass / tearDownClass / module fixture failure
                         failed.update(byname.values())
                     else:
                         failed.add(n)
+                    if _satisfied():
+                        self.stop()
 
                 def addFailure(self, test, err):
                     self._mark(test)
@@ -221,10 +225,10 @@ def child_main(wfd, root, src, patched, tests, nums, limits, failfast=False, che
                 failed.update(byname.values())
             signal.setitimer(signal.ITIMER_PROF, 0)
             lap("run " + c)
-            if failfast and failed - set(noise):
+            if _satisfied():
                 break
         res["failed"] = sorted(failed)
-        res["stopped"] = bool(failfast and failed - set(noise))
+        res["stopped"] = _satisfied()
     except BaseException as e:  # any internal failure: caller falls back to printing candidates
         res = {"failed": [], "ok": False, "err": repr(e)[:200]}
     try:
@@ -234,13 +238,21 @@ def child_main(wfd, root, src, patched, tests, nums, limits, failfast=False, che
 
 
 class Job:
-    def __init__(self, cid, root, src, patched, tests, nums, limits, deadline, failfast=False, check=(), smoke=False, noise=()):
+    _n = 0
+
+    def __init__(self, cid, root, src, patched, tests, nums, limits, deadline, failfast=False, check=(), smoke=False, noise=(), ev_min=1):
         self.cid, self.nums, self.deadline = cid, nums, deadline
+        Job._n += 1
         r, w = os.pipe()
         self.pid = os.fork()
         if self.pid == 0:
             os.close(r)
-            child_main(w, root, src, patched, tests, nums, limits, failfast, check, smoke, noise)
+            try:  # one CPU per child: idle library thread pools (duckdb, BLAS) cannot spread charged CPU
+                cpus = sorted(os.sched_getaffinity(0))
+                os.sched_setaffinity(0, {cpus[Job._n % len(cpus)]})
+            except (AttributeError, OSError, IndexError):
+                pass
+            child_main(w, root, src, patched, tests, nums, limits, failfast, check, smoke, noise, ev_min)
         os.close(w)
         self.fd, self.buf, self.root = r, b"", root
 
